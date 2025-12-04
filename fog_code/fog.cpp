@@ -1,5 +1,6 @@
-// parkinsons_detector_with_cadence.cpp
-// Optimized detector with enhanced FOG vs Normal Stop discrimination
+// parkinsons_detector_with_freeze_index.cpp
+// Enhanced FOG detection using FFT-based Freeze Index (FI)
+// FI = Power(3-8Hz) / Power(0.5-3Hz) - classic clinical metric for FOG
 #include "arm_math.h"
 #include "lsm6dsl_reg.h"
 #include "mbed.h"
@@ -15,10 +16,10 @@ bool csv_header_printed = false;
 #define __FPU_PRESENT 1
 
 // --- Config ---
-constexpr int SAMPLE_SIZE = 128;     // FFT size (keep current)
+constexpr int SAMPLE_SIZE = 128;     // FFT size
 constexpr int BUFFER_SIZE = 156;     // circular buffer size (>= SAMPLE_SIZE + margin)
 
-// Dual-window FOG detection
+// Dual-window FOG detection (kept for supplementary variance check)
 constexpr int FOG_SHORT_WINDOW = 32;
 constexpr int FOG_COMPARE_WINDOW = 32;
 
@@ -46,12 +47,40 @@ static FogState current_state = IDLE;
 static int walking_counter = 0;
 static int fog_counter = 0;
 static int idle_counter = 0;
+static int fog_timeout_counter = 0;  // tracks how long we've been in FOG_DETECTED
 static float previous_variance = 0.0f;
 
-// Tunables (time-domain variance thresholds are scaled for filtered magnitude values)
-constexpr float WALKING_VARIANCE_SHORT = 0.002f; // short-window walking threshold (tune)
-constexpr float FOG_VARIANCE_SHORT = 0.001f;     // short-window fog threshold (tune)
-constexpr float VARIANCE_RATIO_THRESHOLD = 0.5f; // recent/older ratio threshold (tune)
+// ============================================================================
+// FFT-BASED FREEZE INDEX PARAMETERS (NEW)
+// ============================================================================
+// Freeze Index = freeze_power / locomotor_power
+// High FI + low locomotor = FOG
+// Low FI + low locomotor = Normal stop
+// Low FI + high locomotor = Walking
+
+constexpr float FREEZE_INDEX_THRESHOLD = 2.0f;       // FI above this suggests FOG (tune: 1.5-3.0)
+constexpr float LOCOMOTOR_WALKING_THRESHOLD = 5.0f;  // locomotor power above this = walking
+constexpr float LOCOMOTOR_STOP_THRESHOLD = 1.0f;     // locomotor power below this = stopped
+constexpr float FREEZE_POWER_MIN = 0.5f;             // minimum freeze band power to consider FOG
+
+// Frequency bands (Hz)
+constexpr float LOCOMOTOR_BAND_LOW = 0.5f;
+constexpr float LOCOMOTOR_BAND_HIGH = 3.0f;
+constexpr float FREEZE_BAND_LOW = 3.0f;
+constexpr float FREEZE_BAND_HIGH = 8.0f;
+
+// Smoothing for freeze index (simple EMA)
+constexpr float FI_SMOOTHING_ALPHA = 0.3f;  // higher = more responsive, lower = smoother
+static float smoothed_freeze_index = 0.0f;
+static float smoothed_locomotor_power = 0.0f;
+static float smoothed_freeze_power = 0.0f;
+
+// ============================================================================
+// ORIGINAL VARIANCE THRESHOLDS (kept as supplementary)
+// ============================================================================
+constexpr float WALKING_VARIANCE_SHORT = 0.002f;
+constexpr float FOG_VARIANCE_SHORT = 0.001f;
+constexpr float VARIANCE_RATIO_THRESHOLD = 0.5f;
 
 // Tremor/dyskinesia thresholds (frequency-domain)
 constexpr float TREMOR_BIN_THRESHOLD = 2.0f;
@@ -59,24 +88,28 @@ constexpr float DYSKINESIA_BIN_THRESHOLD = 3.0f;
 constexpr float TREMOR_ENERGY_THRESHOLD = 10.0f;
 constexpr float DYSKINESIA_ENERGY_THRESHOLD = 15.0f;
 
-// Step/cadence detection parameters
-constexpr float STEP_PEAK_THRESHOLD = 0.02f;    // HP-filtered magnitude peak threshold for a step (tune)
-constexpr int STEP_REFRACTORY = 10;            // samples (~200ms) refractory period to avoid double-counting a step
-constexpr float CADENCE_WINDOW_SEC = 2.0f;     // seconds to measure recent cadence
-constexpr int MIN_STEPS_FOR_FOG = 5;           // require at least this many steps in recent window to allow FOG
-constexpr int HISTORY_SIZE = 64;  
-constexpr int MIN_WALK_FRAMES = 10; 
+// Step/cadence detection parameters (kept for supplementary info)
+constexpr float STEP_PEAK_THRESHOLD = 0.02f;
+constexpr int STEP_REFRACTORY = 10;
+constexpr float CADENCE_WINDOW_SEC = 2.0f;
+constexpr int MIN_STEPS_FOR_FOG = 5;
+constexpr int HISTORY_SIZE = 64;
+constexpr int MIN_WALK_FRAMES = 10;
 
-// Step-intent detection threshold: small jerk threshold (transient derivative)
-constexpr float STEP_INTENT_DERIV_THRESHOLD = 0.025f; // tune
+// Step-intent detection threshold
+constexpr float STEP_INTENT_DERIV_THRESHOLD = 0.025f;
 
 // Debounce / confirmation
 constexpr int WALKING_CONFIRM_FRAMES = 3;
-constexpr int FOG_CONFIRM_FRAMES = 4;
+constexpr int FOG_CONFIRM_FRAMES = 3;      // reduced from 4 since FI is more reliable
 constexpr int IDLE_GRADUAL_FRAMES = 5;
 constexpr int BLE_STABLE_FRAMES = 3;
 
-// BLE UUIDs (unchanged)
+// FOG timeout - return to IDLE after LED stays blue for this many frames
+// At 52Hz with 20ms loop, ~50 frames per second. 5 seconds = 250 frames
+constexpr int FOG_TIMEOUT_FRAMES = 250;    // ~5 seconds (tune as needed)
+
+// BLE UUIDs
 const UUID PARKINSONS_SERVICE_UUID("12340000-1234-5678-1234-56789abcdef0");
 const UUID TREMOR_CHAR_UUID("12340001-1234-5678-1234-56789abcdef0");
 const UUID DYSKINESIA_CHAR_UUID("12340002-1234-5678-1234-56789abcdef0");
@@ -91,6 +124,10 @@ bool fog_state = false;
 static float walking_history[HISTORY_SIZE] = {0};
 static int walking_history_index = 0;
 
+// --- Freeze Index history for trend detection ---
+constexpr int FI_HISTORY_SIZE = 16;
+static float fi_history[FI_HISTORY_SIZE] = {0};
+static int fi_history_index = 0;
 
 ReadOnlyGattCharacteristic<bool> tremorChar(TREMOR_CHAR_UUID, &tremor_state,
                                            GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY);
@@ -101,66 +138,66 @@ ReadOnlyGattCharacteristic<bool> fogChar(FOG_CHAR_UUID, &fog_state,
 GattCharacteristic *characteristics[] = {&tremorChar, &dyskinesiaChar, &fogChar};
 GattService parkinsonsService(PARKINSONS_SERVICE_UUID, characteristics, 3);
 
-// Platform I2C wrappers (unchanged)
+// Platform I2C wrappers
 int32_t platform_write(void *handle, uint8_t reg, const uint8_t *bufp, uint16_t len) {
-  char data[17];
-  if (len > 16) return -1;
-  data[0] = reg;
-  memcpy(&data[1], bufp, len);
-  return i2c.write(((int)(intptr_t)handle << 1), data, len + 1) == 0 ? 0 : -1;
+    char data[17];
+    if (len > 16) return -1;
+    data[0] = reg;
+    memcpy(&data[1], bufp, len);
+    return i2c.write(((int)(intptr_t)handle << 1), data, len + 1) == 0 ? 0 : -1;
 }
 
 int32_t platform_read(void *handle, uint8_t reg, uint8_t *bufp, uint16_t len) {
-  char reg_addr = reg;
-  if (i2c.write(((int)(intptr_t)handle << 1), &reg_addr, 1, true) != 0) return -1;
-  return i2c.read(((int)(intptr_t)handle << 1), (char *)bufp, len) == 0 ? 0 : -1;
+    char reg_addr = reg;
+    if (i2c.write(((int)(intptr_t)handle << 1), &reg_addr, 1, true) != 0) return -1;
+    return i2c.read(((int)(intptr_t)handle << 1), (char *)bufp, len) == 0 ? 0 : -1;
 }
 
 // BLE debounce helper
 struct BleDebounce {
-  bool last_sent = false;
-  bool candidate = false;
-  int counter = 0;
+    bool last_sent = false;
+    bool candidate = false;
+    int counter = 0;
 } ble_tremor, ble_dyskinesia, ble_fog;
 
 void ble_process_channel(BleDebounce &d, bool candidate_value, ReadOnlyGattCharacteristic<bool> &ch, bool &state_var) {
-  if (candidate_value != d.candidate) {
-    d.candidate = candidate_value;
-    d.counter = 1;
-  } else {
-    if (d.counter > 0) d.counter++;
-  }
-  if (d.counter >= BLE_STABLE_FRAMES && d.last_sent != d.candidate) {
-    d.last_sent = d.candidate;
-    state_var = d.candidate;
-    BLE::Instance().gattServer().write(ch.getValueHandle(), (uint8_t *)&state_var, sizeof(bool));
-  }
+    if (candidate_value != d.candidate) {
+        d.candidate = candidate_value;
+        d.counter = 1;
+    } else {
+        if (d.counter > 0) d.counter++;
+    }
+    if (d.counter >= BLE_STABLE_FRAMES && d.last_sent != d.candidate) {
+        d.last_sent = d.candidate;
+        state_var = d.candidate;
+        BLE::Instance().gattServer().write(ch.getValueHandle(), (uint8_t *)&state_var, sizeof(bool));
+    }
 }
 
 void update_ble(bool tremor, bool dyskinesia, bool fog) {
-  ble_process_channel(ble_tremor, tremor, tremorChar, tremor_state);
-  ble_process_channel(ble_dyskinesia, dyskinesia, dyskinesiaChar, dyskinesia_state);
-  ble_process_channel(ble_fog, fog, fogChar, fog_state);
+    ble_process_channel(ble_tremor, tremor, tremorChar, tremor_state);
+    ble_process_channel(ble_dyskinesia, dyskinesia, dyskinesiaChar, dyskinesia_state);
+    ble_process_channel(ble_fog, fog, fogChar, fog_state);
 }
 
-// Global FFT instance (init once)
+// Global FFT instance
 arm_rfft_fast_instance_f32 fft_instance;
 
-// Simple high-pass IIR to remove gravity / slow drift from magnitude signal
+// Simple high-pass IIR to remove gravity / slow drift
 class HighPass {
 public:
-  HighPass(float a = 0.98f) : alpha(a), y_prev(0.0f), x_prev(0.0f), init(false) {}
-  float filter(float x) {
-    if (!init) { x_prev = x; y_prev = 0.0f; init = true; return 0.0f; }
-    float y = alpha * (y_prev + x - x_prev);
-    y_prev = y;
-    x_prev = x;
-    return y;
-  }
+    HighPass(float a = 0.98f) : alpha(a), y_prev(0.0f), x_prev(0.0f), init(false) {}
+    float filter(float x) {
+        if (!init) { x_prev = x; y_prev = 0.0f; init = true; return 0.0f; }
+        float y = alpha * (y_prev + x - x_prev);
+        y_prev = y;
+        x_prev = x;
+        return y;
+    }
 private:
-  float alpha;
-  float y_prev, x_prev;
-  bool init;
+    float alpha;
+    float y_prev, x_prev;
+    bool init;
 };
 
 HighPass hp(0.98f);
@@ -168,159 +205,235 @@ HighPass hp(0.98f);
 // Forward declaration
 void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate, const float *time_window);
 
+// ============================================================================
+// FREEZE INDEX COMPUTATION (NEW)
+// ============================================================================
+struct FreezeIndexResult {
+    float locomotor_power;   // 0.5-3 Hz band power
+    float freeze_power;      // 3-8 Hz band power
+    float freeze_index;      // freeze_power / locomotor_power
+    bool is_walking;         // high locomotor power
+    bool is_stopped;         // low locomotor power
+    bool fog_signature;      // high FI + stopped + some freeze power
+};
+
+FreezeIndexResult compute_freeze_index(const float *magnitudes, int bins_count, float freq_res) {
+    FreezeIndexResult result = {0};
+    
+    // Compute band powers (using squared magnitudes for power)
+    for (int k = 1; k < bins_count - 1; k++) {
+        float freq = k * freq_res;
+        float power = magnitudes[k] * magnitudes[k];
+        
+        if (freq >= LOCOMOTOR_BAND_LOW && freq < LOCOMOTOR_BAND_HIGH) {
+            result.locomotor_power += power;
+        } else if (freq >= FREEZE_BAND_LOW && freq <= FREEZE_BAND_HIGH) {
+            result.freeze_power += power;
+        }
+    }
+    
+    // Compute freeze index (with safety check for division)
+    if (result.locomotor_power > 1e-6f) {
+        result.freeze_index = result.freeze_power / result.locomotor_power;
+    } else {
+        // If no locomotor power, FI is undefined - set high if freeze power exists
+        result.freeze_index = (result.freeze_power > FREEZE_POWER_MIN) ? 10.0f : 0.0f;
+    }
+    
+    // Apply exponential smoothing
+    smoothed_freeze_index = FI_SMOOTHING_ALPHA * result.freeze_index + 
+                            (1.0f - FI_SMOOTHING_ALPHA) * smoothed_freeze_index;
+    smoothed_locomotor_power = FI_SMOOTHING_ALPHA * result.locomotor_power + 
+                               (1.0f - FI_SMOOTHING_ALPHA) * smoothed_locomotor_power;
+    smoothed_freeze_power = FI_SMOOTHING_ALPHA * result.freeze_power + 
+                            (1.0f - FI_SMOOTHING_ALPHA) * smoothed_freeze_power;
+    
+    // Update FI history for trend detection
+    fi_history[fi_history_index] = smoothed_freeze_index;
+    fi_history_index = (fi_history_index + 1) % FI_HISTORY_SIZE;
+    
+    // Classify movement state
+    result.is_walking = (smoothed_locomotor_power > LOCOMOTOR_WALKING_THRESHOLD);
+    result.is_stopped = (smoothed_locomotor_power < LOCOMOTOR_STOP_THRESHOLD);
+    
+    // FOG signature: high freeze index + stopped/low locomotor + meaningful freeze power
+    result.fog_signature = (smoothed_freeze_index > FREEZE_INDEX_THRESHOLD) &&
+                           (smoothed_locomotor_power < LOCOMOTOR_WALKING_THRESHOLD) &&
+                           (smoothed_freeze_power > FREEZE_POWER_MIN);
+    
+    return result;
+}
+
+// Check if FI has been elevated recently (trend detection)
+bool fi_elevated_recently(int lookback_frames = 8) {
+    int elevated_count = 0;
+    for (int i = 0; i < lookback_frames && i < FI_HISTORY_SIZE; i++) {
+        int idx = (fi_history_index - 1 - i + FI_HISTORY_SIZE) % FI_HISTORY_SIZE;
+        if (fi_history[idx] > FREEZE_INDEX_THRESHOLD * 0.7f) {
+            elevated_count++;
+        }
+    }
+    return (elevated_count >= lookback_frames / 2);
+}
+
 // Initialize sensor, FFT and run main loop
 void test_fft_accelerometer() {
-  int16_t data_raw[3];
-  int buffer_index = 0;
+    int16_t data_raw[3];
+    int buffer_index = 0;
 
-  printf("Initializing sensor and FFT...\n");
+    printf("Initializing sensor and FFT...\n");
+    printf("FOG Detection: Using FFT-based Freeze Index (FI)\n");
+    printf("  Locomotor band: %.1f-%.1f Hz\n", LOCOMOTOR_BAND_LOW, LOCOMOTOR_BAND_HIGH);
+    printf("  Freeze band: %.1f-%.1f Hz\n", FREEZE_BAND_LOW, FREEZE_BAND_HIGH);
+    printf("  FI threshold: %.2f\n", FREEZE_INDEX_THRESHOLD);
 
-  dev_ctx.write_reg = platform_write;
-  dev_ctx.read_reg = platform_read;
-  dev_ctx.handle = (void *)LSM6DSL_I2C_ADDR;
+    dev_ctx.write_reg = platform_write;
+    dev_ctx.read_reg = platform_read;
+    dev_ctx.handle = (void *)LSM6DSL_I2C_ADDR;
 
-  thread_sleep_for(500);
+    thread_sleep_for(500);
 
-  uint8_t whoami = 0;
-  if (lsm6dsl_device_id_get(&dev_ctx, &whoami) != 0 || whoami != 0x6A) {
-    printf("Device not found or ID mismatch. WHO_AM_I = 0x%X\n", whoami);
-    return;
-  }
+    uint8_t whoami = 0;
+    if (lsm6dsl_device_id_get(&dev_ctx, &whoami) != 0 || whoami != 0x6A) {
+        printf("Device not found or ID mismatch. WHO_AM_I = 0x%X\n", whoami);
+        return;
+    }
 
-  lsm6dsl_reset_set(&dev_ctx, PROPERTY_ENABLE);
-  uint8_t rst;
-  do { lsm6dsl_reset_get(&dev_ctx, &rst); } while (rst);
+    lsm6dsl_reset_set(&dev_ctx, PROPERTY_ENABLE);
+    uint8_t rst;
+    do { lsm6dsl_reset_get(&dev_ctx, &rst); } while (rst);
 
-  // ODR 52Hz, full scale 2g
-  lsm6dsl_xl_data_rate_set(&dev_ctx, LSM6DSL_XL_ODR_52Hz);
-  lsm6dsl_xl_full_scale_set(&dev_ctx, LSM6DSL_2g);
+    // ODR 52Hz, full scale 2g
+    lsm6dsl_xl_data_rate_set(&dev_ctx, LSM6DSL_XL_ODR_52Hz);
+    lsm6dsl_xl_full_scale_set(&dev_ctx, LSM6DSL_2g);
 
-  // Initialize FFT instance once
-  if (arm_rfft_fast_init_f32(&fft_instance, SAMPLE_SIZE) != ARM_MATH_SUCCESS) {
-    printf("FFT init failed\n");
-    return;
-  }
+    // Initialize FFT instance once
+    if (arm_rfft_fast_init_f32(&fft_instance, SAMPLE_SIZE) != ARM_MATH_SUCCESS) {
+        printf("FFT init failed\n");
+        return;
+    }
 
-  // Fill buffer initially with a few readings (use HP filter before storing)
-  printf("Collecting baseline samples...\n");
-  for (int i = 0; i < BUFFER_SIZE; i++) {
+    // Fill buffer initially
+    printf("Collecting baseline samples...\n");
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+        while (true) {
+            lsm6dsl_status_reg_t status;
+            lsm6dsl_status_reg_get(&dev_ctx, &status);
+            if (status.xlda) {
+                lsm6dsl_acceleration_raw_get(&dev_ctx, data_raw);
+                float x = lsm6dsl_from_fs2g_to_mg(data_raw[0]) / 1000.0f;
+                float y = lsm6dsl_from_fs2g_to_mg(data_raw[1]) / 1000.0f;
+                float z = lsm6dsl_from_fs2g_to_mg(data_raw[2]) / 1000.0f;
+                float mag = sqrtf(x * x + y * y + z * z);
+                accel_magnitude[i] = hp.filter(mag);
+                break;
+            }
+            thread_sleep_for(1);
+        }
+    }
+
+    printf("Starting continuous motion detection (52Hz)...\n");
+
+    // Main acquisition loop
     while (true) {
-      lsm6dsl_status_reg_t status;
-      lsm6dsl_status_reg_get(&dev_ctx, &status);
-      if (status.xlda) {
-        lsm6dsl_acceleration_raw_get(&dev_ctx, data_raw);
-        float x = lsm6dsl_from_fs2g_to_mg(data_raw[0]) / 1000.0f;
-        float y = lsm6dsl_from_fs2g_to_mg(data_raw[1]) / 1000.0f;
-        float z = lsm6dsl_from_fs2g_to_mg(data_raw[2]) / 1000.0f;
-        float mag = sqrtf(x * x + y * y + z * z);
-        accel_magnitude[i] = hp.filter(mag);
-        break;
-      }
-      thread_sleep_for(1);
+        lsm6dsl_status_reg_t status;
+        lsm6dsl_status_reg_get(&dev_ctx, &status);
+        if (status.xlda) {
+            lsm6dsl_acceleration_raw_get(&dev_ctx, data_raw);
+            float x = lsm6dsl_from_fs2g_to_mg(data_raw[0]) / 1000.0f;
+            float y = lsm6dsl_from_fs2g_to_mg(data_raw[1]) / 1000.0f;
+            float z = lsm6dsl_from_fs2g_to_mg(data_raw[2]) / 1000.0f;
+            float mag = sqrtf(x * x + y * y + z * z);
+
+            // HP filter then store
+            float hp_mag = hp.filter(mag);
+            accel_magnitude[buffer_index] = hp_mag;
+            buffer_index = (buffer_index + 1) % BUFFER_SIZE;
+
+            // Build time-domain window (oldest -> newest)
+            for (int i = 0; i < SAMPLE_SIZE; i++) {
+                int idx = (buffer_index + BUFFER_SIZE - SAMPLE_SIZE + i) % BUFFER_SIZE;
+                fft_input[i] = accel_magnitude[idx];
+            }
+
+            // Keep a copy of unwindowed data for variance analysis
+            float time_window[SAMPLE_SIZE];
+            for (int i = 0; i < SAMPLE_SIZE; i++) {
+                int idx = (buffer_index + BUFFER_SIZE - SAMPLE_SIZE + i) % BUFFER_SIZE;
+                time_window[i] = accel_magnitude[idx];
+            }
+
+            // Apply Hann window for spectral quality
+            for (int n = 0; n < SAMPLE_SIZE; n++) {
+                float w = 0.5f * (1.0f - cosf((2.0f * M_PI * n) / (SAMPLE_SIZE - 1)));
+                fft_input[n] *= w;
+            }
+
+            // Run FFT
+            arm_rfft_fast_f32(&fft_instance, fft_input, output, 0);
+
+            // Unpack CMSIS RFFT output into magnitudes
+            const int bins_count = SAMPLE_SIZE / 2 + 1;
+            static float magnitudes[(SAMPLE_SIZE/2) + 1];
+            magnitudes[0] = fabsf(output[0]);
+            magnitudes[bins_count - 1] = fabsf(output[1]);
+            for (int k = 1; k < bins_count - 1; k++) {
+                float real = output[2 * k];
+                float imag = output[2 * k + 1];
+                magnitudes[k] = sqrtf(real * real + imag * imag);
+            }
+
+            // Analyze
+            analyze_motion(magnitudes, bins_count, 52.0f, time_window);
+        }
+
+        BLE::Instance().processEvents();
+        thread_sleep_for(20);
     }
-  }
-
-  printf("Starting continuous motion detection (52Hz)...\n");
-
-  // Main acquisition loop
-  while (true) {
-    lsm6dsl_status_reg_t status;
-    lsm6dsl_status_reg_get(&dev_ctx, &status);
-    if (status.xlda) {
-      lsm6dsl_acceleration_raw_get(&dev_ctx, data_raw);
-      float x = lsm6dsl_from_fs2g_to_mg(data_raw[0]) / 1000.0f;
-      float y = lsm6dsl_from_fs2g_to_mg(data_raw[1]) / 1000.0f;
-      float z = lsm6dsl_from_fs2g_to_mg(data_raw[2]) / 1000.0f;
-      float mag = sqrtf(x * x + y * y + z * z);
-
-      // HP filter then store
-      float hp_mag = hp.filter(mag);
-      accel_magnitude[buffer_index] = hp_mag;
-      buffer_index = (buffer_index + 1) % BUFFER_SIZE;
-
-      // Build time-domain window (oldest -> newest)
-      for (int i = 0; i < SAMPLE_SIZE; i++) {
-        int idx = (buffer_index + BUFFER_SIZE - SAMPLE_SIZE + i) % BUFFER_SIZE;
-        fft_input[i] = accel_magnitude[idx];
-      }
-
-      // Keep a copy of the un-windowed time-domain data for variance and step analysis
-      float time_window[SAMPLE_SIZE];
-      for (int i = 0; i < SAMPLE_SIZE; i++) {
-        int idx = (buffer_index + BUFFER_SIZE - SAMPLE_SIZE + i) % BUFFER_SIZE;
-        time_window[i] = accel_magnitude[idx];
-      }
-
-      // Apply Hann window for spectral quality
-      for (int n = 0; n < SAMPLE_SIZE; n++) {
-        float w = 0.5f * (1.0f - cosf((2.0f * M_PI * n) / (SAMPLE_SIZE - 1)));
-        fft_input[n] *= w;
-      }
-
-      // Run FFT (output is packed as per CMSIS RFFT)
-      arm_rfft_fast_f32(&fft_instance, fft_input, output, 0);
-
-      // Unpack CMSIS RFFT output into magnitudes array for bins 0..N/2 (inclusive)
-      const int bins_count = SAMPLE_SIZE / 2 + 1; // 0..N/2 inclusive
-      static float magnitudes[ (SAMPLE_SIZE/2) + 1 ];
-      // bin 0 (DC)
-      magnitudes[0] = fabsf(output[0]);
-      // Nyquist bin
-      magnitudes[bins_count - 1] = fabsf(output[1]);
-      // interior bins
-      for (int k = 1; k < bins_count - 1; k++) {
-        float real = output[2 * k];
-        float imag = output[2 * k + 1];
-        magnitudes[k] = sqrtf(real * real + imag * imag);
-      }
-
-      // Analyze (pass bins_count and time_window)
-      analyze_motion(magnitudes, bins_count, 52.0f, time_window);
-    }
-
-    BLE::Instance().processEvents();
-    thread_sleep_for(20);
-  }
 }
 
-// Utility: count recent step-like peaks in time_window (unwindowed), return count
+// Utility: count recent step-like peaks
 static int count_recent_steps(const float *time_window, float sampling_rate) {
-  int window_samples = (int)roundf(CADENCE_WINDOW_SEC * sampling_rate);
-  if (window_samples > SAMPLE_SIZE) window_samples = SAMPLE_SIZE;
-  int start = SAMPLE_SIZE - window_samples;
-  int count = 0;
-  int refractory = 0;
-  for (int i = start+1; i < SAMPLE_SIZE-1; i++) {
-    float v = time_window[i];
-    // simple local-peak + threshold detection
-    if (refractory > 0) { refractory--; continue; }
-    if (v > STEP_PEAK_THRESHOLD && v > time_window[i-1] && v >= time_window[i+1]) {
-      count++;
-      refractory = STEP_REFRACTORY;
+    int window_samples = (int)roundf(CADENCE_WINDOW_SEC * sampling_rate);
+    if (window_samples > SAMPLE_SIZE) window_samples = SAMPLE_SIZE;
+    int start = SAMPLE_SIZE - window_samples;
+    int count = 0;
+    int refractory = 0;
+    for (int i = start+1; i < SAMPLE_SIZE-1; i++) {
+        float v = time_window[i];
+        if (refractory > 0) { refractory--; continue; }
+        if (v > STEP_PEAK_THRESHOLD && v > time_window[i-1] && v >= time_window[i+1]) {
+            count++;
+            refractory = STEP_REFRACTORY;
+        }
     }
-  }
-  return count;
+    return count;
 }
 
-// Utility: detect step-intent transients (derivative peaks) within recent short window
+// Utility: detect step-intent transients
 static int detect_step_intent(const float *time_window) {
-  // compute first derivative and count spikes above threshold
-  int count = 0;
-  for (int i = 1; i < SAMPLE_SIZE; i++) {
-    float deriv = fabsf(time_window[i] - time_window[i-1]);
-    if (deriv > STEP_INTENT_DERIV_THRESHOLD) count++;
-  }
-  // we only care if there was at least one strong transient
-  return (count > 0) ? count : 0;
+    int count = 0;
+    for (int i = 1; i < SAMPLE_SIZE; i++) {
+        float deriv = fabsf(time_window[i] - time_window[i-1]);
+        if (deriv > STEP_INTENT_DERIV_THRESHOLD) count++;
+    }
+    return (count > 0) ? count : 0;
 }
 
 void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate, const float *time_window) {
-    // frequency resolution
-    float freq_res = sampling_rate / (float)((bins_count - 1) * 2); // N = 2*(bins_count-1)
+    // Frequency resolution
+    float freq_res = sampling_rate / (float)((bins_count - 1) * 2);
 
-    // Frequency-domain detection
+    // ========================================================================
+    // COMPUTE FREEZE INDEX (PRIMARY FOG DETECTION)
+    // ========================================================================
+    FreezeIndexResult fi_result = compute_freeze_index(magnitudes, bins_count, freq_res);
+
+    // ========================================================================
+    // TREMOR AND DYSKINESIA DETECTION (unchanged)
+    // ========================================================================
     int tremor_count = 0, dyskinesia_count = 0;
-    float tremor_energy = 0.0f, dyskinesia_energy = 0.0f, trembling_power = 0.0f;
+    float tremor_energy = 0.0f, dyskinesia_energy = 0.0f;
     int max_bin = bins_count - 1;
 
     for (int k = 1; k < max_bin; k++) {
@@ -334,7 +447,6 @@ void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate
             dyskinesia_energy += amp;
             if (amp >= DYSKINESIA_BIN_THRESHOLD) dyskinesia_count++;
         }
-        if (freq >= 3.0f && freq <= 8.0f) trembling_power += amp;
     }
 
     bool tremor_detected = (tremor_count >= 1) || (tremor_energy > TREMOR_ENERGY_THRESHOLD);
@@ -342,7 +454,9 @@ void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate
     led_tremor = tremor_detected ? 1 : 0;
     led_dyskinesia = dyskinesia_detected ? 1 : 0;
 
-    // Time-domain variance windows for FOG
+    // ========================================================================
+    // SUPPLEMENTARY: Time-domain variance (kept as secondary signal)
+    // ========================================================================
     float recent_mean = 0.0f, recent_variance = 0.0f;
     for (int i = SAMPLE_SIZE - FOG_SHORT_WINDOW; i < SAMPLE_SIZE; i++) recent_mean += time_window[i];
     recent_mean /= FOG_SHORT_WINDOW;
@@ -362,9 +476,7 @@ void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate
     }
     older_variance /= FOG_COMPARE_WINDOW;
 
-    float variance_ratio = (older_variance > 1e-8f) ? (recent_variance / older_variance) : 1.0f;
-
-    // --- Update walking history ---
+    // Update walking history
     walking_history[walking_history_index] = recent_variance;
     walking_history_index = (walking_history_index + 1) % HISTORY_SIZE;
 
@@ -373,151 +485,212 @@ void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate
         if (walking_history[i] > WALKING_VARIANCE_SHORT) recent_walking_frames++;
     bool sufficient_recent_walking = (recent_walking_frames >= MIN_WALK_FRAMES);
 
-    // Steps & intent
+    // Steps & intent (supplementary)
     int recent_steps = count_recent_steps(time_window, sampling_rate);
     int step_intent_count = detect_step_intent(time_window);
-    float recent_cadence = recent_steps / (float)CADENCE_WINDOW_SEC;
 
     bool fog_detected = false;
 
-    // --- Enhanced state machine ---
+    // ========================================================================
+    // ENHANCED STATE MACHINE (FFT-based Freeze Index as primary signal)
+    // ========================================================================
     switch (current_state) {
-        case IDLE: // IDLE
-            if (recent_variance > WALKING_VARIANCE_SHORT) {
+        case IDLE:
+            // Transition to WALKING based on locomotor power OR variance
+            if (fi_result.is_walking || recent_variance > WALKING_VARIANCE_SHORT) {
                 walking_counter++;
                 if (walking_counter >= WALKING_CONFIRM_FRAMES) {
-                    current_state = WALKING; // WALKING
+                    current_state = WALKING;
                     walking_counter = 0;
-                    printf("State -> WALKING\n");
+                    printf("State -> WALKING (loco=%.2f, var=%.4f)\n", 
+                           smoothed_locomotor_power, recent_variance);
                 }
-            } else walking_counter = 0;
+            } else {
+                walking_counter = 0;
+            }
             led_fog = 1;
             break;
 
-        case WALKING: // WALKING
+        case WALKING:
         {
-            bool sudden_stop = (older_variance > WALKING_VARIANCE_SHORT*0.5f) &&
-                               (recent_variance < FOG_VARIANCE_SHORT) &&
-                               (variance_ratio < VARIANCE_RATIO_THRESHOLD);
-            bool trembling_ok = (trembling_power > TREMOR_ENERGY_THRESHOLD*0.5f);
-            bool intent_ok = (step_intent_count > 0);
-
-            if ( (sudden_stop && sufficient_recent_walking && (trembling_ok || intent_ok)) ||
-                 (recent_variance < FOG_VARIANCE_SHORT && sufficient_recent_walking && (trembling_ok || intent_ok)) ) {
+            // PRIMARY: Check for FOG signature from freeze index
+            bool fi_fog_trigger = fi_result.fog_signature && sufficient_recent_walking;
+            
+            // SECONDARY: Original variance-based sudden stop detection
+            bool sudden_stop = (older_variance > WALKING_VARIANCE_SHORT * 0.5f) &&
+                               (recent_variance < FOG_VARIANCE_SHORT);
+            
+            // Combined trigger: FI-based OR (variance-based AND has some freeze power)
+            if (fi_fog_trigger || 
+                (sudden_stop && sufficient_recent_walking && smoothed_freeze_power > FREEZE_POWER_MIN * 0.5f)) {
                 current_state = FOG_POSSIBLE;
                 fog_counter = 0;
                 idle_counter = 0;
-                printf("State -> FOG_POSSIBLE\n");
-            } else if (recent_variance < FOG_VARIANCE_SHORT && older_variance < (WALKING_VARIANCE_SHORT*0.5f)) {
+                printf("State -> FOG_POSSIBLE (FI=%.2f, loco=%.2f, freeze=%.2f)\n",
+                       smoothed_freeze_index, smoothed_locomotor_power, smoothed_freeze_power);
+            }
+            // Check for gradual stop to IDLE (no freeze signature)
+            else if (fi_result.is_stopped && !fi_result.fog_signature && 
+                     smoothed_freeze_index < FREEZE_INDEX_THRESHOLD * 0.5f) {
                 idle_counter++;
                 if (idle_counter >= IDLE_GRADUAL_FRAMES) {
-                    current_state = IDLE; // IDLE
+                    current_state = IDLE;
                     idle_counter = 0;
-                    printf("State -> IDLE (gradual stop)\n");
+                    printf("State -> IDLE (clean stop, FI=%.2f)\n", smoothed_freeze_index);
                 }
-            } else idle_counter = 0;
+            } else {
+                idle_counter = 0;
+            }
 
             led_fog = 1;
         }
         break;
 
-        case FOG_POSSIBLE: // FOG_POSSIBLE
+        case FOG_POSSIBLE:
         {
-            bool trembling_ok = (trembling_power > TREMOR_ENERGY_THRESHOLD*0.5f);
-            bool intent_ok = (step_intent_count > 0);
-
-            if (recent_variance < FOG_VARIANCE_SHORT && (trembling_ok || intent_ok)) {
+            // Confirm FOG using freeze index (primary) or sustained freeze power
+            bool fi_confirms_fog = fi_result.fog_signature || 
+                                   (smoothed_freeze_index > FREEZE_INDEX_THRESHOLD * 0.7f && 
+                                    smoothed_freeze_power > FREEZE_POWER_MIN);
+            
+            if (fi_confirms_fog) {
                 fog_counter++;
                 if (fog_counter >= FOG_CONFIRM_FRAMES) {
-                    current_state = FOG_DETECTED; // FOG_DETECTED
+                    current_state = FOG_DETECTED;
                     fog_detected = true;
+                    fog_timeout_counter = 0;  // reset timeout when entering FOG_DETECTED
                     led_fog = 0;
-                    printf("State -> FOG_DETECTED\n");
+                    printf("State -> FOG_DETECTED (FI=%.2f, frames=%d)\n", 
+                           smoothed_freeze_index, fog_counter);
                 }
-            } else if (recent_variance > WALKING_VARIANCE_SHORT) {
-                current_state = WALKING; // WALKING
+            }
+            // Return to WALKING if locomotor power increases
+            else if (fi_result.is_walking) {
+                current_state = WALKING;
                 fog_counter = 0;
-                printf("State -> WALKING (resumed)\n");
+                printf("State -> WALKING (resumed, loco=%.2f)\n", smoothed_locomotor_power);
+            }
+            // Return to IDLE if clean stop (low FI, low freeze power)
+            else if (fi_result.is_stopped && smoothed_freeze_index < FREEZE_INDEX_THRESHOLD * 0.3f &&
+                     smoothed_freeze_power < FREEZE_POWER_MIN * 0.3f) {
+                idle_counter++;
+                if (idle_counter >= IDLE_GRADUAL_FRAMES) {
+                    current_state = IDLE;
+                    idle_counter = 0;
+                    fog_counter = 0;
+                    printf("State -> IDLE (false alarm, FI=%.2f)\n", smoothed_freeze_index);
+                }
+            } else {
+                idle_counter = 0;
             }
         }
         break;
 
-        case FOG_DETECTED: // FOG_DETECTED
+        case FOG_DETECTED:
             fog_detected = true;
             led_fog = 0;
-            if (recent_variance > WALKING_VARIANCE_SHORT) {
-                current_state = WALKING; // WALKING
+            fog_timeout_counter++;  // increment timeout counter
+            
+            // Exit FOG when locomotor power increases (walking resumed)
+            if (fi_result.is_walking) {
+                current_state = WALKING;
                 led_fog = 1;
                 fog_counter = 0;
-                printf("State -> WALKING (FOG ended)\n");
+                fog_timeout_counter = 0;
+                printf("State -> WALKING (FOG ended, loco=%.2f)\n", smoothed_locomotor_power);
+            }
+            // Exit if freeze index drops significantly
+            else if (smoothed_freeze_index < FREEZE_INDEX_THRESHOLD * 0.3f && 
+                     !fi_elevated_recently(4)) {
+                current_state = IDLE;
+                led_fog = 1;
+                fog_counter = 0;
+                fog_timeout_counter = 0;
+                printf("State -> IDLE (FOG resolved, FI=%.2f)\n", smoothed_freeze_index);
+            }
+            // TIMEOUT: Return to IDLE after LED has been blue for too long
+            else if (fog_timeout_counter >= FOG_TIMEOUT_FRAMES) {
+                current_state = IDLE;
+                led_fog = 1;
+                fog_counter = 0;
+                fog_timeout_counter = 0;
+                printf("State -> IDLE (FOG timeout after %d frames)\n", FOG_TIMEOUT_FRAMES);
             }
             break;
     }
 
     previous_variance = recent_variance;
 
+    // Debug output (optional - comment out for production)
+    static int debug_counter = 0;
+    if (++debug_counter >= 26) {  // ~every 0.5s at 52Hz
+        debug_counter = 0;
+        printf("FI=%.2f loco=%.2f freeze=%.2f var=%.4f state=%d\n",
+               smoothed_freeze_index, smoothed_locomotor_power, 
+               smoothed_freeze_power, recent_variance, current_state);
+    }
+
     // BLE update
     update_ble(tremor_detected, dyskinesia_detected, fog_detected);
 }
 
-// BLE and utility functions (unchanged)
+// BLE initialization functions
 void onBleInitError(BLE &ble, ble_error_t error) {
-  printf("BLE Init failed: %d\n", error);
+    printf("BLE Init failed: %d\n", error);
 }
 
 void printMacAddress() {
-  BLE &ble = BLE::Instance();
-  ble::own_address_type_t addrType;
-  ble::address_t address;
-  ble.gap().getAddress(addrType, address);
-  printf("MAC Address: %02X:%02X:%02X:%02X:%02X:%02X\n",
-         address[5], address[4], address[3], address[2], address[1], address[0]);
+    BLE &ble = BLE::Instance();
+    ble::own_address_type_t addrType;
+    ble::address_t address;
+    ble.gap().getAddress(addrType, address);
+    printf("MAC Address: %02X:%02X:%02X:%02X:%02X:%02X\n",
+           address[5], address[4], address[3], address[2], address[1], address[0]);
 }
 
 void bleInitComplete(BLE::InitializationCompleteCallbackContext *params) {
-  BLE &ble = params->ble;
-  ble_error_t error = params->error;
-  if (error != BLE_ERROR_NONE) { onBleInitError(ble, error); return; }
+    BLE &ble = params->ble;
+    ble_error_t error = params->error;
+    if (error != BLE_ERROR_NONE) { onBleInitError(ble, error); return; }
 
-  printMacAddress();
+    printMacAddress();
 
-  ble.gattServer().addService(parkinsonsService);
+    ble.gattServer().addService(parkinsonsService);
 
-  ble::AdvertisingParameters adv_params(ble::advertising_type_t::CONNECTABLE_UNDIRECTED,
-                                        ble::adv_interval_t(ble::millisecond_t(1000)));
+    ble::AdvertisingParameters adv_params(ble::advertising_type_t::CONNECTABLE_UNDIRECTED,
+                                          ble::adv_interval_t(ble::millisecond_t(1000)));
 
-  static uint8_t adv_buffer[ble::LEGACY_ADVERTISING_MAX_SIZE];
-  ble::AdvertisingDataBuilder adv_data_builder(adv_buffer);
+    static uint8_t adv_buffer[ble::LEGACY_ADVERTISING_MAX_SIZE];
+    ble::AdvertisingDataBuilder adv_data_builder(adv_buffer);
 
-  adv_data_builder.setFlags(ble::adv_data_flags_t::BREDR_NOT_SUPPORTED |
-                            ble::adv_data_flags_t::LE_GENERAL_DISCOVERABLE);
-  adv_data_builder.setName("ParkinsonsDetector");
-  adv_data_builder.setLocalServiceList(mbed::make_Span(&PARKINSONS_SERVICE_UUID, 1));
+    adv_data_builder.setFlags(ble::adv_data_flags_t::BREDR_NOT_SUPPORTED |
+                              ble::adv_data_flags_t::LE_GENERAL_DISCOVERABLE);
+    adv_data_builder.setName("ParkinsonsDetector");
+    adv_data_builder.setLocalServiceList(mbed::make_Span(&PARKINSONS_SERVICE_UUID, 1));
 
-  ble.gap().setAdvertisingParameters(ble::LEGACY_ADVERTISING_HANDLE, adv_params);
-  ble.gap().setAdvertisingPayload(ble::LEGACY_ADVERTISING_HANDLE, adv_data_builder.getAdvertisingData());
-  ble.gap().startAdvertising(ble::LEGACY_ADVERTISING_HANDLE);
+    ble.gap().setAdvertisingParameters(ble::LEGACY_ADVERTISING_HANDLE, adv_params);
+    ble.gap().setAdvertisingPayload(ble::LEGACY_ADVERTISING_HANDLE, adv_data_builder.getAdvertisingData());
+    ble.gap().startAdvertising(ble::LEGACY_ADVERTISING_HANDLE);
 
-  printf("BLE Initialized and Advertising...\n");
+    printf("BLE Initialized and Advertising...\n");
 }
 
 int main() {
-  thread_sleep_for(1000);
-  printf("System Start\n");
+    thread_sleep_for(1000);
+    printf("=== Parkinson's Detector with FFT-based FOG Detection ===\n");
+    printf("System Start\n");
 
-  BLE &ble = BLE::Instance();
-  ble.init(bleInitComplete);
-  printf("Initializing BLE...\n");
+    BLE &ble = BLE::Instance();
+    ble.init(bleInitComplete);
+    printf("Initializing BLE...\n");
 
-  while (!ble.hasInitialized()) {
-    ble.processEvents();
-    thread_sleep_for(10);
-  }
-  printf("BLE Initialized\n");
+    while (!ble.hasInitialized()) {
+        ble.processEvents();
+        thread_sleep_for(10);
+    }
+    printf("BLE Initialized\n");
 
-  test_fft_accelerometer();
+    test_fft_accelerometer();
 
-  return 0;
+    return 0;
 }
-
-
