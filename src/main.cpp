@@ -307,6 +307,17 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
 
   previous_variance = variance;
 
+  static int tp_counter = 0;
+
+  // Print more frequently for smooth Teleplot curves
+  if (++tp_counter >= 5) {
+      printf(">Tremor:%d\n", int(tremor_detected));
+      printf(">Dyskinesia:%d\n", int(dyskinesia_detected));
+      printf(">Variance:%d\n", (int)variance);
+      printf(">State:%d\n", (int)current_state);
+      tp_counter = 0;
+  }
+
   update_ble(tremor_detected, dyskinesia_detected, fog_detected);
 }
 
