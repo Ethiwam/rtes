@@ -391,7 +391,7 @@ void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate
                     printf("State -> WALKING\n");
                 }
             } else walking_counter = 0;
-            led_fog = 0;
+            led_fog = 1;
             break;
 
         case WALKING: // WALKING
@@ -417,7 +417,7 @@ void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate
                 }
             } else idle_counter = 0;
 
-            led_fog = 0;
+            led_fog = 1;
         }
         break;
 
@@ -431,7 +431,7 @@ void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate
                 if (fog_counter >= FOG_CONFIRM_FRAMES) {
                     current_state = FOG_DETECTED; // FOG_DETECTED
                     fog_detected = true;
-                    led_fog = 1;
+                    led_fog = 0;
                     printf("State -> FOG_DETECTED\n");
                 }
             } else if (recent_variance > WALKING_VARIANCE_SHORT) {
@@ -444,10 +444,10 @@ void analyze_motion(const float *magnitudes, int bins_count, float sampling_rate
 
         case FOG_DETECTED: // FOG_DETECTED
             fog_detected = true;
-            led_fog = 1;
+            led_fog = 0;
             if (recent_variance > WALKING_VARIANCE_SHORT) {
                 current_state = WALKING; // WALKING
-                led_fog = 0;
+                led_fog = 1;
                 fog_counter = 0;
                 printf("State -> WALKING (FOG ended)\n");
             }
