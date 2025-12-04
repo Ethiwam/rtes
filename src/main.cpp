@@ -100,33 +100,41 @@ int32_t platform_read(void *handle, uint8_t reg, uint8_t *bufp, uint16_t len) {
   return i2c.read(((int)(intptr_t)handle << 1), (char *)bufp, len) == 0 ? 0 : -1;
 }
 
-void send_TREMOR_notification() {
-  if(fog_state) {
+void update_ble_classifier(bool tremor, bool dyskinesia, bool fog) {
+  if (fog) {
     strcpy((char*)TREMORValue, FOG_STRING);
-  } else if(dyskinesia_state) {
+  } else if (dyskinesia) {
     strcpy((char*)TREMORValue, DYSKINESIA_STRING);
-  } else {
+  } else if (tremor) {
     strcpy((char*)TREMORValue, TREMOR_STRING);
+  } else {
+    strcpy((char*)TREMORValue, NONE);
   }
 
-  //send notification
   ble_interface.gattServer().write(
       TREMORTypeCharacteristic.getValueHandle(),
       TREMORValue,
       strlen((char*)TREMORValue) + 1
   );
 
-  //print current state
-  printf("Current State, sent notification: %s\n", TREMORValue);
-
-  // led = !led;
-  // Switch states between tremor and dyskinesia states
-  if (dyskinesia_state) {
-    dyskinesia_state = false;
-  } else if (tremor_state) {
-    tremor_state = false;
-  }
+  printf("BLE notification updated: %s\n", TREMORValue);
 }
+
+// void update_ble(bool tremor, bool dyskinesia, bool fog) {
+//   BLE &ble = BLE::Instance();
+//   if (tremor != tremor_state) {
+//     tremor_state = tremor;
+//     ble.gattServer().write(tremorChar.getValueHandle(), (uint8_t *)&tremor_state, sizeof(bool));
+//   }
+//   if (dyskinesia != dyskinesia_state) {
+//     dyskinesia_state = dyskinesia;
+//     ble.gattServer().write(dyskinesiaChar.getValueHandle(), (uint8_t *)&dyskinesia_state, sizeof(bool));
+//   }
+//   if (fog != fog_state) {
+//     fog_state = fog;
+//     ble.gattServer().write(fogChar.getValueHandle(), (uint8_t *)&fog_state, sizeof(bool));
+//   }
+// }
 
 void on_ble_init_complete(BLE::InitializationCompleteCallbackContext *params) {
     // Check if there was an error during initialization
@@ -171,27 +179,11 @@ void on_ble_init_complete(BLE::InitializationCompleteCallbackContext *params) {
     ble_interface.gap().startAdvertising(LEGACY_ADVERTISING_HANDLE);
 
     printf("BLE initialized and advertising started.\n");
-    event_queue.call_every(500, send_TREMOR_notification);
 }
 
 void schedule_ble_events(BLE::OnEventsToProcessCallbackContext *context) {
     event_queue.call(callback(&ble_interface, &BLE::processEvents));
 }
-// void update_ble(bool tremor, bool dyskinesia, bool fog) {
-//   BLE &ble = BLE::Instance();
-//   if (tremor != tremor_state) {
-//     tremor_state = tremor;
-//     ble.gattServer().write(tremorChar.getValueHandle(), (uint8_t *)&tremor_state, sizeof(bool));
-//   }
-//   if (dyskinesia != dyskinesia_state) {
-//     dyskinesia_state = dyskinesia;
-//     ble.gattServer().write(dyskinesiaChar.getValueHandle(), (uint8_t *)&dyskinesia_state, sizeof(bool));
-//   }
-//   if (fog != fog_state) {
-//     fog_state = fog;
-//     ble.gattServer().write(fogChar.getValueHandle(), (uint8_t *)&fog_state, sizeof(bool));
-//   }
-// }
 
 void analyze_motion(const float *magnitudes, int sample_size, float sampling_rate);
 
@@ -414,6 +406,9 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
       }
       break;
   }
+
+  //call BLE update function
+  update_ble_classifier(tremor_detected, dyskinesia_detected, fog_detected);
 
   previous_variance = variance;
 
