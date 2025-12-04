@@ -2,9 +2,18 @@
 #include "lsm6dsl_reg.h"
 #include "mbed.h"
 #include "ble/BLE.h"
+#include "ble/Gap.h"
+#include "ble/gatt/GattCharacteristic.h"
+#include "ble/gatt/GattService.h"
+#include "ble/gap/AdvertisingDataBuilder.h"
+#include "events/EventQueue.h"
+#include <string.h>
 
 // ARM_MATH_CM4 is already defined by the build system
 #define __FPU_PRESENT 1
+
+using namespace ble;
+using namespace events;
 
 constexpr int SAMPLE_SIZE = 128;
 constexpr int BUFFER_SIZE = 156;
@@ -33,25 +42,49 @@ constexpr float WALKING_VARIANCE_THRESHOLD = 100.0f;  // Require significant mov
 constexpr float FOG_VARIANCE_THRESHOLD = 70.0f;       // Still/frozen state (will show ~700000)
 constexpr float FOG_ENERGY_THRESHOLD = 5.0f;          // Lower threshold
 
+
+BLE &ble_interface = BLE::Instance();
+EventQueue event_queue;
+
 // BLE UUIDs
-const UUID PARKINSONS_SERVICE_UUID("12340000-1234-5678-1234-56789abcdef0");
-const UUID TREMOR_CHAR_UUID("12340001-1234-5678-1234-56789abcdef0");
-const UUID DYSKINESIA_CHAR_UUID("12340002-1234-5678-1234-56789abcdef0");
-const UUID FOG_CHAR_UUID("12340003-1234-5678-1234-56789abcdef0");
+const UUID TREMOR_SERVICE_UUID("12345678-1234-5678-1234-56789abcdef0");
+const UUID TREMOR_TYPE_CHAR_UUID("12345678-1234-5678-1234-56789abcdef1");
+
+// Status strings
+const char* NONE = "NONE";
+const char* TREMOR_STRING = "TREMOR";
+const char* DYSKINESIA_STRING = "DYSKINESIA";
+const char* FOG_STRING = "FOG";
+
+// Maximum string length for our TREMOR type (including null terminator)
+#define MAX_TREMOR_STRING_LEN 11
+
+// Buffer to hold our TREMOR type string
+// Initialize with "TREMOR"
+uint8_t TREMORValue[MAX_TREMOR_STRING_LEN];
+
+//GATT Server  (your embedded device)
+//  └── Service(s)
+//        └── Characteristic(s)
+//              └── Descriptor(s)
+
+// BLE Characteristics
+ReadOnlyArrayGattCharacteristic<uint8_t, MAX_TREMOR_STRING_LEN> TREMORTypeCharacteristic(
+    TREMOR_TYPE_CHAR_UUID,
+    TREMORValue,
+    GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY
+);
+
+GattCharacteristic *charTable[] = { &TREMORTypeCharacteristic };
+GattService tremorService(TREMOR_SERVICE_UUID, charTable, 1);
 
 bool tremor_state = false;
 bool dyskinesia_state = false;
 bool fog_state = false;
 
-ReadOnlyGattCharacteristic<bool> tremorChar(TREMOR_CHAR_UUID, &tremor_state,
-                                             GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY);
-ReadOnlyGattCharacteristic<bool> dyskinesiaChar(DYSKINESIA_CHAR_UUID, &dyskinesia_state,
-                                                 GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY);
-ReadOnlyGattCharacteristic<bool> fogChar(FOG_CHAR_UUID, &fog_state,
-                                          GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY);
-
-GattCharacteristic *characteristics[] = {&tremorChar, &dyskinesiaChar, &fogChar};
-GattService parkinsonsService(PARKINSONS_SERVICE_UUID, characteristics, 3);
+void init_TREMOR_value() {
+  strcpy((char*)TREMORValue, NONE);
+}
 
 int32_t platform_write(void *handle, uint8_t reg, const uint8_t *bufp, uint16_t len) {
   char data[17];
@@ -67,21 +100,98 @@ int32_t platform_read(void *handle, uint8_t reg, uint8_t *bufp, uint16_t len) {
   return i2c.read(((int)(intptr_t)handle << 1), (char *)bufp, len) == 0 ? 0 : -1;
 }
 
-void update_ble(bool tremor, bool dyskinesia, bool fog) {
-  BLE &ble = BLE::Instance();
-  if (tremor != tremor_state) {
-    tremor_state = tremor;
-    ble.gattServer().write(tremorChar.getValueHandle(), (uint8_t *)&tremor_state, sizeof(bool));
+void send_TREMOR_notification() {
+  if(fog_state) {
+    strcpy((char*)TREMORValue, FOG_STRING);
+  } else if(dyskinesia_state) {
+    strcpy((char*)TREMORValue, DYSKINESIA_STRING);
+  } else {
+    strcpy((char*)TREMORValue, TREMOR_STRING);
   }
-  if (dyskinesia != dyskinesia_state) {
-    dyskinesia_state = dyskinesia;
-    ble.gattServer().write(dyskinesiaChar.getValueHandle(), (uint8_t *)&dyskinesia_state, sizeof(bool));
-  }
-  if (fog != fog_state) {
-    fog_state = fog;
-    ble.gattServer().write(fogChar.getValueHandle(), (uint8_t *)&fog_state, sizeof(bool));
+
+  //send notification
+  ble_interface.gattServer().write(
+      TREMORTypeCharacteristic.getValueHandle(),
+      TREMORValue,
+      strlen((char*)TREMORValue) + 1
+  );
+
+  //print current state
+  printf("Current State, sent notification: %s\n", TREMORValue);
+
+  // led = !led;
+  // Switch states between tremor and dyskinesia states
+  if (dyskinesia_state) {
+    dyskinesia_state = false;
+  } else if (tremor_state) {
+    tremor_state = false;
   }
 }
+
+void on_ble_init_complete(BLE::InitializationCompleteCallbackContext *params) {
+    // Check if there was an error during initialization
+    if (params->error != BLE_ERROR_NONE) {
+      printf("BLE initialization failed.\n");
+      return;
+    }
+
+    // Initialize our TREMOR value to "TREMOR"
+    init_TREMOR_value();
+
+    // Add our TREMOR _ service to the BLE server
+    ble_interface.gattServer().addService(tremorService);
+
+    // Set up the advertising (how our device announces itself)
+    // First create a buffer to hold the advertising data
+    uint8_t adv_buffer[LEGACY_ADVERTISING_MAX_SIZE];
+    AdvertisingDataBuilder adv_data(adv_buffer);
+
+    // Set standard BLE flags
+    adv_data.setFlags();
+
+    //Set device name
+    adv_data.setName("ParkinsonsDetector");
+
+    // Configure how often we advertise (160 * 0.625ms = 100ms)
+    // 0.625ms is the standard BLE time unit
+    ble_interface.gap().setAdvertisingParameters(
+        LEGACY_ADVERTISING_HANDLE,
+        AdvertisingParameters(
+            advertising_type_t::CONNECTABLE_UNDIRECTED,
+            adv_interval_t(160)  // 100ms 
+        )
+    );
+
+    // Set the advertising payload
+    ble_interface.gap().setAdvertisingPayload(
+        LEGACY_ADVERTISING_HANDLE,
+        adv_data.getAdvertisingData());
+
+    // Start advertising
+    ble_interface.gap().startAdvertising(LEGACY_ADVERTISING_HANDLE);
+
+    printf("BLE initialized and advertising started.\n");
+    event_queue.call_every(500, send_TREMOR_notification);
+}
+
+void schedule_ble_events(BLE::OnEventsToProcessCallbackContext *context) {
+    event_queue.call(callback(&ble_interface, &BLE::processEvents));
+}
+// void update_ble(bool tremor, bool dyskinesia, bool fog) {
+//   BLE &ble = BLE::Instance();
+//   if (tremor != tremor_state) {
+//     tremor_state = tremor;
+//     ble.gattServer().write(tremorChar.getValueHandle(), (uint8_t *)&tremor_state, sizeof(bool));
+//   }
+//   if (dyskinesia != dyskinesia_state) {
+//     dyskinesia_state = dyskinesia;
+//     ble.gattServer().write(dyskinesiaChar.getValueHandle(), (uint8_t *)&dyskinesia_state, sizeof(bool));
+//   }
+//   if (fog != fog_state) {
+//     fog_state = fog;
+//     ble.gattServer().write(fogChar.getValueHandle(), (uint8_t *)&fog_state, sizeof(bool));
+//   }
+// }
 
 void analyze_motion(const float *magnitudes, int sample_size, float sampling_rate);
 
@@ -318,7 +428,7 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
       tp_counter = 0;
   }
 
-  update_ble(tremor_detected, dyskinesia_detected, fog_detected);
+  // update_ble(tremor_detected, dyskinesia_detected, fog_detected);
 }
 
 void onBleInitError(BLE &ble, ble_error_t error) {
@@ -344,7 +454,7 @@ void bleInitComplete(BLE::InitializationCompleteCallbackContext *params) {
 
   printMacAddress();
 
-  ble.gattServer().addService(parkinsonsService);
+  ble.gattServer().addService(tremorService);
 
   ble::AdvertisingParameters adv_params(ble::advertising_type_t::CONNECTABLE_UNDIRECTED,
                                          ble::adv_interval_t(ble::millisecond_t(1000)));
@@ -355,7 +465,7 @@ void bleInitComplete(BLE::InitializationCompleteCallbackContext *params) {
   adv_data_builder.setFlags(ble::adv_data_flags_t::BREDR_NOT_SUPPORTED |
                              ble::adv_data_flags_t::LE_GENERAL_DISCOVERABLE);
   adv_data_builder.setName("ParkinsonsDetector");
-  adv_data_builder.setLocalServiceList(mbed::make_Span(&PARKINSONS_SERVICE_UUID, 1));
+  adv_data_builder.setLocalServiceList(mbed::make_Span(&TREMOR_SERVICE_UUID, 1));
 
   ble.gap().setAdvertisingParameters(ble::LEGACY_ADVERTISING_HANDLE, adv_params);
   ble.gap().setAdvertisingPayload(ble::LEGACY_ADVERTISING_HANDLE, adv_data_builder.getAdvertisingData());
