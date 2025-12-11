@@ -1,3 +1,5 @@
+// Group: Ethan Iwama (emi6692), Vanshika Bagaria (vb2596), Hao Ding (hd2891), Anokhi Mehta (am16455), Arun Purohit (ap9111)
+
 #include "arm_math.h"
 #include "lsm6dsl_reg.h"
 #include "mbed.h"
@@ -43,12 +45,12 @@ FogState current_state = IDLE;
 int walking_counter = 0;
 int fog_counter = 0;
 float previous_variance = 0.0f;
-float baseline_variance = 65.0f;                    // Typical idle variance observed
-constexpr float WALKING_VARIANCE_THRESHOLD = 95.0f; // Require significant movement (will show ~1000000)-------------------------
-constexpr float FOG_VARIANCE_THRESHOLD = 70.0f;     // Still/frozen state (will show ~700000)
-constexpr float FOG_ENERGY_THRESHOLD = 5.0f;        // Lower threshold
-int fog_timeout_counter = 0;                        //----------------------------
-constexpr int FOG_TIMEOUT_SAMPLES = 150;            //----------------------------
+float baseline_variance = 65.0f;                    
+constexpr float WALKING_VARIANCE_THRESHOLD = 95.0f; 
+constexpr float FOG_VARIANCE_THRESHOLD = 70.0f;
+constexpr float FOG_ENERGY_THRESHOLD = 5.0f;
+int fog_timeout_counter = 0;      
+constexpr int FOG_TIMEOUT_SAMPLES = 150;
 
 BLE &ble_interface = BLE::Instance();
 EventQueue event_queue;
@@ -69,11 +71,6 @@ const char *FOG_STRING = "FOG";
 // Buffer to hold our TREMOR type string
 // Initialize with "TREMOR"
 uint8_t TREMORValue[MAX_TREMOR_STRING_LEN];
-
-// GATT Server  (your embedded device)
-//   └── Service(s)
-//         └── Characteristic(s)
-//               └── Descriptor(s)
 
 // BLE Characteristics
 ReadOnlyArrayGattCharacteristic<uint8_t, MAX_TREMOR_STRING_LEN> TREMORTypeCharacteristic(
@@ -138,22 +135,6 @@ void update_ble_classifier(bool tremor, bool dyskinesia, bool fog)
   printf("BLE notification updated: %s\n", TREMORValue);
 }
 
-// void update_ble(bool tremor, bool dyskinesia, bool fog) {
-//   BLE &ble = BLE::Instance();
-//   if (tremor != tremor_state) {
-//     tremor_state = tremor;
-//     ble.gattServer().write(tremorChar.getValueHandle(), (uint8_t *)&tremor_state, sizeof(bool));
-//   }
-//   if (dyskinesia != dyskinesia_state) {
-//     dyskinesia_state = dyskinesia;
-//     ble.gattServer().write(dyskinesiaChar.getValueHandle(), (uint8_t *)&dyskinesia_state, sizeof(bool));
-//   }
-//   if (fog != fog_state) {
-//     fog_state = fog;
-//     ble.gattServer().write(fogChar.getValueHandle(), (uint8_t *)&fog_state, sizeof(bool));
-//   }
-// }
-
 void on_ble_init_complete(BLE::InitializationCompleteCallbackContext *params)
 {
   // Check if there was an error during initialization
@@ -169,8 +150,6 @@ void on_ble_init_complete(BLE::InitializationCompleteCallbackContext *params)
   // Add our TREMOR _ service to the BLE server
   ble_interface.gattServer().addService(tremorService);
 
-  // Set up the advertising (how our device announces itself)
-  // First create a buffer to hold the advertising data
   uint8_t adv_buffer[LEGACY_ADVERTISING_MAX_SIZE];
   AdvertisingDataBuilder adv_data(adv_buffer);
 
@@ -310,7 +289,6 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
 {
   float frequency_resolution = sampling_rate / sample_size;
 
-  // Lower thresholds for easier detection
   float tremor_threshold = 10.0f;
   float dyskinesia_threshold = 20.0f;
 
@@ -320,7 +298,7 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
   float dyskinesia_energy = 0.0f;
   float fog_energy = 0.0f;
 
-  // Calculate variance using detrended data (remove gravity baseline)
+  // Calculate variance using detrended data 
   float mean = 0.0f;
   float variance = 0.0f;
   for (int i = 0; i < sample_size; i++)
@@ -329,7 +307,6 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
   }
   mean /= sample_size;
 
-  // Remove mean (gravity component) and calculate variance
   for (int i = 0; i < sample_size; i++)
   {
     float detrended = fft_input[i] - mean;
@@ -365,7 +342,7 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
     }
   }
 
-  // More sensitive detection - use either bin count OR energy
+  // More sensitive detection use bin count OR energy
   bool tremor_detected = (tremor_count >= 1) || (tremor_energy > 30.0f);
   bool dyskinesia_detected = (dyskinesia_count >= 1) || (dyskinesia_energy > 40.0f);
 
@@ -399,11 +376,11 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
   }
 
   bool fog_detected = false;
-  static uint32_t fog_start_time = 0; // time to enter the FOG_DETECTED (ms）----------------------
+  static uint32_t fog_start_time = 0; 
 
   // Detect sudden drop in variance (FOG event)
   float variance_drop = previous_variance - variance;
-  bool sudden_drop = (variance_drop > 2.0f) && (variance < baseline_variance + 10.0f); //----------------------------
+  bool sudden_drop = (variance_drop > 2.0f) && (variance < baseline_variance + 10.0f); 
 
   switch (current_state)
   {
@@ -428,8 +405,7 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
   case WALKING:
     // Check for sudden drop to baseline (FOG event)
 
-    // if (sudden_drop || variance < FOG_VARIANCE_THRESHOLD)
-    if (sudden_drop) //--------------------------------------------
+    if (sudden_drop) 
     {
       current_state = FOG_POSSIBLE;
       fog_counter = 0;
@@ -443,7 +419,7 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
     {
       fog_counter++;
       if (fog_counter > 0)
-      { // Faster detection
+      { 
         current_state = FOG_DETECTED;
 
         printf("State: FOG_DETECTED\n");
@@ -460,7 +436,7 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
   case FOG_DETECTED:
     led_fog = 1;
     fog_detected = true;
-    fog_timeout_counter++; //--------------------------------
+    fog_timeout_counter++;
     if (variance > WALKING_VARIANCE_THRESHOLD)
     {
       current_state = WALKING;
@@ -468,7 +444,7 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
       fog_timeout_counter = 0;
       printf("State: WALKING (FOG ended)\n");
     }
-    else if (fog_timeout_counter >= FOG_TIMEOUT_SAMPLES) //--------------------------
+    else if (fog_timeout_counter >= FOG_TIMEOUT_SAMPLES)
     {
       current_state = IDLE;
       led_fog = 0;
@@ -485,7 +461,7 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
 
   static int tp_counter = 0;
 
-  // Print more frequently for smooth Teleplot curves
+  // Teleplot curves
   if (++tp_counter >= 5)
   {
     printf(">Tremor:%d\n", int(tremor_detected));
@@ -495,7 +471,6 @@ void analyze_motion(const float *magnitudes, int sample_size, float sampling_rat
     tp_counter = 0;
   }
 
-  // update_ble(tremor_detected, dyskinesia_detected, fog_detected);
 }
 
 void onBleInitError(BLE &ble, ble_error_t error)
@@ -535,7 +510,7 @@ void bleInitComplete(BLE::InitializationCompleteCallbackContext *params)
 
   adv_data_builder.setFlags(ble::adv_data_flags_t::BREDR_NOT_SUPPORTED |
                             ble::adv_data_flags_t::LE_GENERAL_DISCOVERABLE);
-  adv_data_builder.setName("ParkinsonsDetector_Hao");
+  adv_data_builder.setName("ParkinsonsDetector");
   adv_data_builder.setLocalServiceList(mbed::make_Span(&TREMOR_SERVICE_UUID, 1));
 
   ble.gap().setAdvertisingParameters(ble::LEGACY_ADVERTISING_HANDLE, adv_params);
